@@ -132,7 +132,12 @@ async fn run_qbxml(config: &Config) -> Result<()> {
     */
     let app_name = config.quickbooks.application_name.as_deref().unwrap_or("QuickBooks Sync Service"); 
     
-    if let Ok(()) = processor.open_connection(app_id, app_name) {
+    let open_connection_result = processor.open_connection(app_id, app_name);
+    if let Err(e) = &open_connection_result {
+        eprintln!("[QBXML] open_connection failed: {:#}", e);
+    }
+
+    if open_connection_result.is_ok() {
 
         // sets company_file to AUTO if blank, company file name if provided in config.toml
         let company_file = match config.quickbooks.company_file.as_str() { 
