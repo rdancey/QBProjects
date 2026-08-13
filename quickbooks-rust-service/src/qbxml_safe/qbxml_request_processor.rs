@@ -145,7 +145,7 @@ impl QbxmlRequestProcessor {
         Ok(Some(response_xml))
     }
 
-    pub fn get_account_balance(&self, response_xml: &str, account_full_name: &str) -> Result<Option<f64>, anyhow::Error> {
+    pub fn get_account_balance(response_xml: &str, account_full_name: &str) -> Result<Option<f64>, anyhow::Error> {
         let mut balance = 0.0;
         let mut found = false;
         let mut search_start = 0;

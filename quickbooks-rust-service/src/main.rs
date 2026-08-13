@@ -1,15 +1,16 @@
 mod file_mode;
 mod config;
 mod qbxml_safe;
+mod qb_worker;
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use log::info;
-use winapi::um::winnt::UpdateBlackBoxRecorder;
 use std::env;
-use futures::future::join_all; 
+use std::io::Write;
+use std::sync::Mutex;
+use futures::future::join_all;
 
 use crate::config::{AccountSyncConfig, TimestampConfig, Config};
-use crate::file_mode::FileMode;
 use crate::qbxml_safe::qbxml_request_processor::QbxmlRequestProcessor;
 mod google_sheets;
 use google_sheets::GoogleSheetsClient;
@@ -39,9 +40,9 @@ fn print_instructions() {
     println!();
 }
 
-async fn process_sync_blocks(processor: &QbxmlRequestProcessor, response_xml: &str, the_sync_block: &AccountSyncConfig, config: &Config) -> Result<()> {
+async fn process_sync_blocks(response_xml: &str, the_sync_block: &AccountSyncConfig, config: &Config) -> Result<()> {
     let gs_cfg = &config.google_sheets;
-    match processor.get_account_balance(&response_xml, &the_sync_block.account_full_name) {
+    match QbxmlRequestProcessor::get_account_balance(response_xml, &the_sync_block.account_full_name) {
     Ok(Some(account_balance)) => {
         info!("[QBXML] Account '{}' balance is: {:?}", the_sync_block.account_full_name, account_balance);
         let gs_client = GoogleSheetsClient::new(
@@ -76,17 +77,17 @@ async fn process_timestamp_blocks(the_timestamp_block: &TimestampConfig, config:
         the_timestamp_block.spreadsheet_id.clone(),
         );
     gs_client.send_timestamp(
-        Some(&formatted_time), 
+        Some(&formatted_time),
         Some(&the_timestamp_block.sheet_name),
         Some(&the_timestamp_block.cell_address),
         ).await?;
     Ok(())
 }
 
-async fn process_qbxml(processor: &QbxmlRequestProcessor, response_xml: &str, config: &Config) -> Result<()> {
+async fn process_qbxml(response_xml: &str, config: &Config) -> Result<()> {
     // Process sync blocks in parallel
     let sync_futures = config.sync_blocks.iter().map(|sync_block| {
-        process_sync_blocks(processor, response_xml, sync_block, config)
+        process_sync_blocks(response_xml, sync_block, config)
     });
     let sync_results = join_all(sync_futures).await;
     for result in sync_results {
@@ -106,113 +107,165 @@ async fn process_qbxml(processor: &QbxmlRequestProcessor, response_xml: &str, co
 }
 
 async fn run_qbxml(config: &Config) -> Result<()> {
-    unsafe {
-        let hr = winapi::um::combaseapi::CoInitializeEx(std::ptr::null_mut(), winapi::um::objbase::COINIT_APARTMENTTHREADED);
-        // We can bail out here if there is a failure because nothing will need to be cleaned up
-        if hr < 0 {
-            return Err(anyhow::anyhow!("Failed to initialize COM system: HRESULT=0x{:08X}", hr));
+    // Resolve the company file ("AUTO" -> empty string lets QuickBooks use the open/hosted file).
+    let company_file = match config.quickbooks.company_file.as_str() {
+        "AUTO" => String::new(),
+        path => {
+            println!("[DEBUG] Company file: {}", path);
+            path.to_string()
         }
-    }
-
-    let processor = match QbxmlRequestProcessor::new() {
-        Ok(processor) => processor,
-        Err(e) => {
-            eprintln!("[QBXML]: Failed to create QBXML request processor: {:#}", e);
-            // YOLO - this is the only cleanup needed at this point in the function
-            unsafe { winapi::um::combaseapi::CoUninitialize();  }
-            return Err(e);
-            },
     };
-    
-    // AppID isn't used by the QBSDK, if a value is passed in config it is harmless but not used
-    let app_id = config.quickbooks.application_id.as_deref().unwrap_or(""); 
 
-    /*  If we ever change the name of the service we register with Quickbooks we'll have 
-    to change this default too in order to ensure the program will work even if the config.toml loses this setting
-    */
-    let app_name = config.quickbooks.application_name.as_deref().unwrap_or("QuickBooks Sync Service"); 
-    
-    let open_connection_result = processor.open_connection(app_id, app_name);
-    if let Err(e) = &open_connection_result {
-        eprintln!("[QBXML] open_connection failed: {:#}", e);
+    let app_name = config
+        .quickbooks
+        .application_name
+        .clone()
+        .unwrap_or_else(|| "QuickBooks Sync Service".to_string());
+
+    // Watchdog timeout for the entire QuickBooks exchange, in seconds.
+    let timeout_secs = config.quickbooks.connection_timeout.unwrap_or(120) as u64;
+
+    // Snapshot qbw.exe already running in THIS session, so cleanup only ever targets the instance
+    // QuickBooks auto-launches for this run -- never another user's interactive QuickBooks.
+    let pre_pids = qb_worker::qbw_pids_in_current_session();
+
+    // Run all COM work on a dedicated STA thread and wait on it with a watchdog timeout, so a
+    // stalled/unresponsive QuickBooks can never hang this process indefinitely.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cf = company_file.clone();
+    let an = app_name.clone();
+    std::thread::spawn(move || {
+        let result = qb_worker::fetch_account_xml(&cf, &an);
+        let _ = tx.send(result);
+    });
+
+    let response_xml = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(Ok(xml))) => {
+            info!("[QBXML] Retrieved account data from QuickBooks");
+            xml
+        }
+        Ok(Ok(Err(e))) => {
+            eprintln!("[QBXML] QuickBooks access failed: {:#}", e);
+            cleanup_owned_qbw(&pre_pids);
+            return Err(e);
+        }
+        Ok(Err(_recv)) => {
+            cleanup_owned_qbw(&pre_pids);
+            return Err(anyhow::anyhow!("QuickBooks worker thread ended unexpectedly"));
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "[QBXML] QuickBooks access timed out after {}s; terminating this run's QuickBooks instance",
+                timeout_secs
+            );
+            log::error!("QuickBooks access timed out after {}s", timeout_secs);
+            cleanup_owned_qbw(&pre_pids);
+            return Err(anyhow::anyhow!("QuickBooks access timed out after {}s", timeout_secs));
+        }
+    };
+
+    // The worker already ended the session and closed the connection. As a safety net, make sure
+    // the auto-launched QuickBooks instance is not left running before we do any network I/O.
+    cleanup_owned_qbw(&pre_pids);
+
+    // QuickBooks is fully released; now push the values to Google Sheets. A slow or hung Apps
+    // Script call can no longer hold a QuickBooks session open or orphan a qbw.exe.
+    match process_qbxml(&response_xml, config).await {
+        Err(e) => eprintln!("[QBXML] Error processing QBXML: {:#}", e),
+        Ok(()) => eprintln!("[QBXML] Processing succeeded"),
+    };
+
+    Ok(())
+}
+
+/// Terminate any qbw.exe in the current session that appeared after `pre_pids` was captured,
+/// i.e. the instance QuickBooks auto-launched for this run. Session-scoped so it never touches
+/// another user's interactive QuickBooks on a shared/RDS host.
+fn cleanup_owned_qbw(pre_pids: &[u32]) {
+    let owned: Vec<u32> = qb_worker::qbw_pids_in_current_session()
+        .into_iter()
+        .filter(|pid| !pre_pids.contains(pid))
+        .collect();
+    if !owned.is_empty() {
+        log::info!(
+            "Cleaning up {} auto-launched qbw.exe instance(s) in this session",
+            owned.len()
+        );
+        qb_worker::terminate_pids(&owned);
+    }
+}
+
+struct DualLogger {
+    level: log::LevelFilter,
+    file: Option<Mutex<std::fs::File>>,
+}
+
+impl log::Log for DualLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= self.level
     }
 
-    if open_connection_result.is_ok() {
-
-        // sets company_file to AUTO if blank, company file name if provided in config.toml
-        let company_file = match config.quickbooks.company_file.as_str() { 
-            "AUTO" => "",
-            path => {
-                println!("[DEBUG] Company file: {}", path);
-                path }
-            };
-    
-        // we could try to check to see if we have an apparenlty valid ticket here but ...
-        let ticket = processor.begin_session(company_file, crate::FileMode::DoNotCare)?;
-
-        /* 
-        ... we'll get the Err and Ok(None) match arms deal with it if the ticket is invalid
-        */
-        match processor.get_account_xml(&ticket) {
-            Ok(Some(response_xml)) => {
-                // for debugging this line shows us what we got from the API
-                // it outputs more lines than are saved in the console so the output has to be routed somewhere to read it
-                // info!("{}", response_xml);
-                
-                // this is it! This is where all the real processing starts!
-                match process_qbxml(&processor, &response_xml, &config).await {
-                    Err(e) => eprintln!("[QBXML] Error processing QBXML: {:#}", e),
-                    Ok(()) => eprintln!("[QBXML] Processing succeeded")
-                };
-            },
-            Ok(None) => {
-                eprintln!("[QBXML] No response_xml received, ticket probably invalid");
-            },
-            Err(e) => {
-                /* 
-                we can't exit the function here because it is possible that we have an open connection or have
-                initialized the COM system and we need to try to clean Up before we exit
-                */
-                eprintln!("[QBXML] Error querying Quickbooks: {:#}", e);
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let line = format!(
+            "{} [{}] {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            record.level(),
+            record.args()
+        );
+        eprintln!("{}", line);
+        if let Some(file) = &self.file {
+            if let Ok(mut handle) = file.lock() {
+                let _ = writeln!(handle, "{}", line);
             }
         }
-        /* 
-        The COM system has returned all sorts of values for tickets when the ticket fails to be created
-        so we can't just assume that we can detect an invalid ticket; we should attempt to close the
-        session regardless of what we got as a ticket.
+    }
 
-        We don't want to bail out here in the event of an error because there are still cleanup steps needed
-        */
-        if let Err(e) = processor.end_session(&ticket) {
-            eprintln!("[QBXML] end_session errored: {:#}", e)
+    fn flush(&self) {
+        if let Some(file) = &self.file {
+            if let Ok(mut handle) = file.lock() {
+                let _ = handle.flush();
+            }
         }
-
     }
+}
 
-    /* 
-    Begin cleanup. Because it is hard to test earlier to see if we have a valid state for COM 
-    we have to try to clean up everything just in case something managed to open or initialize even if
-    running process_qbxml() failed
-    */
-
-    /* 
-    We want to try to continue clean up even if this fails
-    I think this could happen if the connection was not open but the COM system was initialized
-    */
-    if let Err(e) = processor.close_connection() {
-        eprintln!("[QBXML] close_connection errored: {:#}", e);
+/// Open (append) today's log file in a `logs/` directory next to the executable.
+fn open_log_file() -> Option<std::fs::File> {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
     }
+    let path = dir.join(format!(
+        "qb_sync_{}.log",
+        chrono::Local::now().format("%Y-%m-%d")
+    ));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
 
-    /*
-    YOLO
-    */
-    unsafe { winapi::um::combaseapi::CoUninitialize(); }
-
-    /* 
-    THis is a pretty unhelpful Ok(()) tbh; it really just means the program didn't crash not that
-    it actually achieved its objectives
-    */
-    Ok(())
+fn setup_logging(verbose: bool) {
+    let level = if verbose {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
+    let logger = DualLogger {
+        level,
+        file: open_log_file().map(Mutex::new),
+    };
+    if log::set_boxed_logger(Box::new(logger)).is_ok() {
+        log::set_max_level(level);
+    }
 }
 
 #[tokio::main]
@@ -223,30 +276,26 @@ async fn main() {
 
     if verbose {
         print_instructions();
-        env_logger::builder().filter_level(log::LevelFilter::Debug).init();
-    } else {
-        env_logger::builder().filter_level(log::LevelFilter::Info).init();
     }
+    setup_logging(verbose);
+
     // Load configuration
     let config = match Config::load_from_file("config/config.toml") {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Error: {:#}", e);
-
             // no config.toml? we out!
             std::process::exit(1);
         }
     };
     // Do the work
     match run_qbxml(&config).await {
-      Err(e) => {
+        Err(e) => {
             eprintln!("Error: {:#}", e);
             std::process::exit(1);
-        },
-      Ok(()) => {
-            // Happy Path!
-            // doing nothing
-            // will return with exit code 0
+        }
+        Ok(()) => {
+            // Happy Path! exit code 0
         }
     };
 }
